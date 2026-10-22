@@ -1,0 +1,213 @@
+# ==============================================================================
+# QR Detection Project .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Python & Virtual Environments
+# ------------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Bytecode and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution, packaging, and build artifacts
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing, coverage, and static analysis caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+.tox/
+.nox/
+coverage.xml
+nosetests.xml
+htmlcov/
+coverage_html_report/
+.hypothesis/
+
+# ------------------------------------------------------------------------------
+# 2. Secrets & Local Configuration
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+credentials.json
+client_secret*.json
+
+# ------------------------------------------------------------------------------
+# 3. Operating System Files
+# ------------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Linux / generic editor backups
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ------------------------------------------------------------------------------
+# 4. IDE & Editor Artifacts
+# ------------------------------------------------------------------------------
+# Visual Studio Code (preserves team settings & extension recommendations)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim, Emacs, swap files
+*.swp
+*.swo
+*.swn
+\#*\#
+.#*
+
+# ------------------------------------------------------------------------------
+# 5. Machine Learning Artifacts & Training Outputs
+# ------------------------------------------------------------------------------
+# Temporary training checkpoints & interim model weights
+checkpoints/
+checkpoint-*/
+*.ckpt
+*.pt.tmp
+*.pth.tmp
+*.safetensors.tmp
+
+# Experiment trackers & TensorBoard output
+wandb/
+runs/
+logs/
+*.log
+lightning_logs/
+events.out.tfevents.*
+.tensorboard/
+
+# ML cache directories
+.cache/
+cache/
+
+# Canonical model checkpoints required for inference & project reproducibility
+!models/autoencoder/saved/autoencoder.pth
+!models/vit/saved/model.safetensors
+!models/vit/saved/config.json
+!models/vit/saved/preprocessor_config.json
+
+# ------------------------------------------------------------------------------
+# 6. Dataset & Evaluation Outputs
+# ------------------------------------------------------------------------------
+# Note: The data/ directory (academic dataset) and results/ (baseline reports & 
+# figures) are deliberately version-controlled and preserved.
+# Only disposable temporary scratch files are ignored.
+results/tmp/
+results/temp/
+results/*.tmp
+temp/
+tmp/
+*.tmp
+*.temp
+
+# ------------------------------------------------------------------------------
+# 7. Jupyter Notebooks
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+# (Actual .ipynb notebook files remain trackable)
+
+# ------------------------------------------------------------------------------
+# 8. Application & Streamlit Artifacts
+# ------------------------------------------------------------------------------
+# Streamlit secrets (protect sensitive local configs while preserving config.toml)
+.streamlit/secrets.toml
+!.streamlit/config.toml
+
+# Disposable camera captures or temporary inspection exports
+app/temp/
+app/tmp/
+app/captures/temp_*
+temp_*.png
+temp_*.jpg
+
+# ------------------------------------------------------------------------------
+# 9. Dependency Manifests & Project Metadata
+# ------------------------------------------------------------------------------
+# Explicitly keep dependency and documentation files trackable:
+!requirements.txt
+!requirements*.txt
+!pyproject.toml
+!setup.py
+!setup.cfg
+!README.md
+!README*.md
+!LICENSE
