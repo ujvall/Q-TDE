@@ -1,0 +1,31 @@
+# Q-TDE theme. Hex values mirror the OKLCH tokens in app/gui.css.
+# Light and dark are both defined, so Streamlit follows the OS preference.
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+font = "IBM Plex Sans:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap, sans-serif"
+headingFont = "IBM Plex Sans, sans-serif"
+codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap, monospace"
+baseRadius = "6px"
+buttonRadius = "6px"
+showWidgetBorder = true
+
+[theme.light]
+primaryColor = "#1e59cd"
+backgroundColor = "#f9fafc"
+secondaryBackgroundColor = "#f0f3f6"
+textColor = "#191d24"
+borderColor = "#dde0e4"
+linkColor = "#1e59cd"
+codeBackgroundColor = "#f0f3f6"
+
+[theme.dark]
+primaryColor = "#7daafd"
+backgroundColor = "#0e1114"
+secondaryBackgroundColor = "#171a1e"
+textColor = "#e9ebee"
+borderColor = "#2b2e33"
+linkColor = "#7daafd"
+codeBackgroundColor = "#171a1e"

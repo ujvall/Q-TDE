@@ -1,16 +1,22 @@
 """
-QR Code Security Inspection Engine - Minimal Technical Dashboard.
+Q-TDE: QR Code Tampering & URL Risk Inspection, Streamlit interface.
 
-Single-page web GUI built with Streamlit.
-Consumes app/inspector.py to evaluate two strictly independent evidence dimensions:
-1. Physical / Structural Tampering Integrity (Reed-Solomon ECC + Classical Peak Edge Gradient)
-2. Cyber / Destination URL Risk (Deterministic Static URL Structural Analysis)
+Consumes app/inspector.py and reports two strictly independent evidence dimensions:
+1. Physical integrity (Reed-Solomon ECC for Version 3-M + classical peak high-frequency residual)
+2. URL structure (deterministic static analysis; nothing is fetched or executed)
+
+Run from the project root:  streamlit run app/gui.py
+Styling lives in app/gui.css; theme colors and fonts in .streamlit/config.toml.
 """
 
+import base64
+import html
 import os
 import sys
-import numpy as np
+
 import cv2
+import numpy as np
+import qrcode
 import streamlit as st
 
 # Ensure project root is present in sys.path
@@ -20,592 +26,688 @@ if PROJECT_ROOT not in sys.path:
 
 from app.inspector import inspect_image
 from app.camera import QRCameraProcessor
+from preprocessing.qr_preprocessor import preprocess_qr_image
 
 camera_processor = QRCameraProcessor(target_size=370)
 
+REPO_URL = "https://github.com/ujvall/Q-TDE"
+CSS_PATH = os.path.join(os.path.dirname(__file__), "gui.css")
+
+# Dataset samples are not committed, so only offer the ones present on disk.
+_SAMPLE_CANDIDATES = {
+    "Genuine, benign URL": ("data/val/genuine/genuine_001.png", "Validation sample 001"),
+    "Tampered, ECC violation": ("data/val/tampered/tampered_028.png", "Validation sample 028"),
+    "Tampered, visual anomaly": ("data/val/tampered/tampered_065.png", "Validation sample 065"),
+}
+SAMPLES = {
+    label: (os.path.join(PROJECT_ROOT, path), caption)
+    for label, (path, caption) in _SAMPLE_CANDIDATES.items()
+    if os.path.exists(os.path.join(PROJECT_ROOT, path))
+}
+
+
+
+def esc(value) -> str:
+    """HTML-escape untrusted text; `$` is escaped too so Streamlit markdown never renders it as LaTeX."""
+    return html.escape(str(value)).replace("$", "&#36;")
+
+
+def html_block(markup: str) -> None:
+    """Render trusted markup as one raw HTML block (blank lines would end the block in CommonMark)."""
+    st.markdown("\n".join(line.strip() for line in markup.splitlines() if line.strip()), unsafe_allow_html=True)
+
 
 # ============================================================
-# PAGE CONFIGURATION & MINIMAL DESIGN SYSTEM
+# STATE VOCABULARY
+# Each state: (title, tone, glyph). Glyph: fill = evidence, hollow = none found, hatch = not assessed.
+# ============================================================
+
+PHYSICAL_STATES = {
+    "tampering_detected": ("Tampering detected", "danger", "fill"),
+    "no_tampering_evidence_detected": ("No tampering evidence", "clear", "hollow"),
+    "unsupported_geometry": ("Unsupported geometry", "muted", "hatch"),
+    "detection_failed": ("No QR code located", "muted", "hatch"),
+    "decode_failed": ("Located, not decoded", "warn", "hatch"),
+    "unavailable": ("Analysis unavailable", "muted", "hatch"),
+}
+
+URL_STATES = {
+    "none": ("No structural indicators", "clear", "hollow"),
+    "low": ("Low structural risk", "caution", "fill"),
+    "moderate": ("Moderate structural risk", "warn", "fill"),
+    "high": ("High structural risk", "danger", "fill"),
+    "non_url_payload": ("Not a URL", "muted", "hatch"),
+    "unavailable": ("No payload to analyse", "muted", "hatch"),
+}
+
+EVIDENCE = {
+    "ecc_integrity_violation": (
+        "Reed-Solomon syndrome mismatch",
+        "Sampled codewords no longer satisfy the Version 3-M error-correction equations.",
+    ),
+    "local_visual_anomaly": (
+        "High-frequency residual above τ",
+        "A local edge residual exceeded the calibrated threshold.",
+    ),
+}
+
+SEVERITY_TONE = {"CRITICAL": "danger", "HIGH": "danger", "MODERATE": "warn", "LOW": "caution"}
+
+PREP_STATUS = {
+    "SUCCESS": "Located, rectified, decoded",
+    "DECODE_FAILED": "Located and rectified, not decoded",
+    "UNSUPPORTED_VERSION": "Located, unsupported version",
+    "NO_QR_DETECTED": "No symbol found",
+    "PERSPECTIVE_WARP_FAILED": "Rectification failed",
+    "INVALID_IMAGE": "Unreadable image",
+}
+
+
+def mod(kind: str) -> str:
+    return f'<span class="qt-mod" data-k="{kind}" aria-hidden="true"></span>'
+
+
+def physical_meaning(status: str, res: dict) -> str:
+    prep = res.get("preprocessing") or {}
+    if status == "tampering_detected":
+        return "At least one physical check found evidence that the symbol was altered."
+    if status == "no_tampering_evidence_detected":
+        return "Neither physical check fired. That is not proof the code is genuine."
+    if status == "unsupported_geometry":
+        version = prep.get("detected_version")
+        found = f"Version {version} symbol found" if version else "Symbol geometry not recognised"
+        return f"{found}. ECC analysis currently supports Version 3-M only; the visual residual stayed below τ."
+    if status == "detection_failed":
+        return esc(prep.get("message") or "No QR symbol could be localized in this image.")
+    if status == "decode_failed":
+        return "A symbol was found but its payload could not be read, so the ECC check could not run."
+    return esc(res.get("tampering", {}).get("summary") or "The physical analysis did not complete.")
+
+
+def url_meaning(level: str) -> str:
+    return {
+        "none": "No structural rule matched. This says nothing about whether the destination is safe.",
+        "low": "Minor structural indicators matched. The score is a heuristic, not a probability of harm.",
+        "moderate": "Several structural indicators matched. Treat the destination with caution.",
+        "high": "Critical or multiple structural indicators matched. Do not open without verifying the source.",
+        "non_url_payload": "The payload is plain text or other data; URL analysis does not apply.",
+    }.get(level, "There is no decoded payload, so URL structure could not be assessed.")
+
+
+# ============================================================
+# RENDERING HELPERS
+# ============================================================
+
+def to_data_uri(img: np.ndarray, max_side: int = 720) -> str:
+    h, w = img.shape[:2]
+    scale = min(1.0, max_side / max(h, w))
+    if scale < 1.0:
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".png", img)
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+
+
+def frame_html(img, caption: str, meta: str, corners=None, pixelated: bool = False) -> str:
+    if img is None:
+        return (
+            f'<figure class="qt-frame"><div class="qt-empty-frame">{esc(meta)}</div>'
+            f'<figcaption><span>{esc(caption)}</span><span>none</span></figcaption></figure>'
+        )
+    h, w = img.shape[:2]
+    overlay = ""
+    if corners is not None:
+        pts = np.asarray(corners, dtype=float).reshape(-1, 2)
+        if len(pts) == 4:
+            points = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            overlay = (
+                f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" aria-hidden="true">'
+                f'<polygon class="qt-corners" pathLength="1" points="{points}"/></svg>'
+            )
+    px = " qt-px" if pixelated else ""
+    return (
+        f'<figure class="qt-frame"><div class="qt-frame-img{px}">'
+        f'<img src="{to_data_uri(img)}" alt="{esc(caption)}"/>{overlay}</div>'
+        f'<figcaption><span>{esc(caption)}</span><span>{w} × {h} px</span></figcaption></figure>'
+    )
+
+
+def scale_html(value: float, hi: float, tone: str, ticks, bands, labels, aria: str) -> str:
+    pct = lambda v: f"{max(0.0, min(1.0, v / hi)) * 100:.2f}%"
+    band_html = "".join(
+        f'<span class="qt-band" data-tone="{t}" style="left:{pct(a)};width:calc({pct(b)} - {pct(a)})"></span>'
+        for a, b, t in bands
+    )
+    tick_html = "".join(f'<span class="qt-tick {cls}" style="left:{pct(v)}"></span>' for v, cls in ticks)
+    label_html = "".join(f'<span style="left:{pct(v)}">{esc(t)}</span>' for v, t in labels)
+    return (
+        f'<div class="qt-scale" role="img" aria-label="{esc(aria)}">'
+        f'<div class="qt-track">{band_html}{tick_html}'
+        f'<span class="qt-needle" data-tone="{tone}" style="--v:{max(0.0, min(1.0, value / hi)):.4f}"></span></div>'
+        f'<div class="qt-scale-labels" aria-hidden="true">{label_html}</div></div>'
+    )
+
+
+ACRONYMS = {"URL", "HTTP", "IP", "IDN"}
+
+
+def humanize(code: str) -> str:
+    """EXECUTABLE_DOWNLOAD_EXTENSION -> Executable download extension, keeping acronyms upright."""
+    words = [w if w in ACRONYMS else w.lower() for w in str(code).split("_")]
+    if words and words[0] not in ACRONYMS:
+        words[0] = words[0].capitalize()
+    return " ".join(words)
+
+
+def yes_no(value) -> str:
+    return "Yes" if value else "No"
+
+
+# ============================================================
+# STATIC SECTIONS
+# ============================================================
+
+MARK_SVG = (
+    '<svg class="qt-mark" viewBox="0 0 7 7" aria-hidden="true">'
+    '<path fill="currentColor" fill-rule="evenodd" d="M0 0h7v7H0z M1 1v5h5V1z M2 2h3v3H2z"/></svg>'
+)
+
+NAV_HTML = f"""
+<header class="qt-nav">
+  <a class="qt-brand" href="#top" aria-label="Q-TDE home">{MARK_SVG}
+    <span class="qt-word">Q-TDE</span>
+    <span class="qt-word-sub">QR tampering &amp; URL risk inspection</span>
+  </a>
+  <nav class="qt-nav-links" aria-label="Sections">
+    <a href="#inspect">Inspect</a>
+    <a href="#method">Method</a>
+    <a href="#limits" class="qt-hide-sm">Limits</a>
+    <a href="{REPO_URL}" class="qt-ext" target="_blank" rel="noopener">GitHub</a>
+  </nav>
+</header>
+"""
+
+
+@st.cache_data
+def hero_figure_html() -> str:
+    """A genuine Version 3-M symbol for the repository URL, with an illustrated altered region."""
+    qr = qrcode.QRCode(version=3, error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
+    qr.add_data(REPO_URL)
+    qr.make(fit=False)
+    matrix = [list(row) for row in qr.get_matrix()]
+    n = len(matrix)
+
+    r0, c0, rows, cols = 15, 16, 4, 6  # data region, clear of finder, timing and alignment patterns
+    altered = set()
+    for r in range(r0, r0 + rows):
+        for c in range(c0, c0 + cols):
+            if (r * 5 + c * 3) % 3 == 0:
+                matrix[r][c] = not matrix[r][c]
+                altered.add((r, c))
+
+    cell = lambda r, c: f"M{c} {r}h1v1h-1z"
+    base = "".join(cell(r, c) for r in range(n) for c in range(n) if matrix[r][c] and (r, c) not in altered)
+    alt = "".join(cell(r, c) for r, c in altered if matrix[r][c])
+
+    return f"""
+<figure class="qt-figure">
+  <svg viewBox="0 0 {n} {n}" role="img" aria-label="Illustration of a Version 3-M QR code with a small region of altered modules">
+    <rect width="{n}" height="{n}" fill="#f9fafc"/>
+    <path d="{base}" fill="#191d24"/>
+    <path class="qt-alter" d="{alt}"/>
+    <rect class="qt-alter-box" pathLength="1" x="{c0 - 0.5}" y="{r0 - 0.5}" width="{cols + 1}" height="{rows + 1}"/>
+  </svg>
+  <ul class="qt-notes">
+    <li><span class="qt-key qt-key-alter"></span><span><b>Altered modules</b>
+      Physical integrity: do the codewords still satisfy Reed-Solomon, and is there a residual spike above τ?</span></li>
+    <li><span class="qt-key qt-key-payload"></span><span><b>Encoded payload</b>
+      <code>{esc(REPO_URL)}</code><br/>URL structure: 21 static rules. No request is made.</span></li>
+  </ul>
+  <figcaption>Illustration. A real Version 3-M symbol with a simulated altered region.</figcaption>
+</figure>
+"""
+
+
+HERO_HTML = """
+<div class="qt-hero" id="top">
+  <h1>Inspect the code. <span>Understand the risk.</span></h1>
+  <p class="qt-lede">Q-TDE examines a QR image on two independent axes:
+    <strong>whether the code was altered</strong>, and <strong>how its URL is constructed</strong>.</p>
+</div>
+"""
+
+METHOD_HTML = """
+<section class="qt-section" aria-labelledby="method-title">
+  <span id="method" class="qt-anchor"></span>
+  <h2 class="qt-h2" id="method-title">Two questions, answered separately</h2>
+  <p class="qt-intro">Shared preprocessing feeds two branches that never read each other's output.
+    The interface reports both and does not merge them into a single verdict.</p>
+
+  <div class="qt-pipe">
+    <div class="qt-stage-label">Shared preprocessing</div>
+    <div class="qt-shared">
+      <div class="qt-step"><h3><i>1</i>Localize</h3>
+        <p>OpenCV <code>QRCodeDetector</code>, with an ArUco-based fallback, finds the four symbol corners.</p></div>
+      <div class="qt-step"><h3><i>2</i>Rectify</h3>
+        <p>Perspective warp to <code>370 × 370</code> px with a normalized four-module quiet zone.</p></div>
+      <div class="qt-step"><h3><i>3</i>Decode</h3>
+        <p>The payload and symbol version are read; the version decides whether ECC analysis can run.</p></div>
+    </div>
+    <div class="qt-fork" aria-hidden="true"></div>
+    <div class="qt-lanes">
+      <div class="qt-lane">
+        <div class="qt-lane-head"><h3>Physical integrity</h3><span>image evidence</span></div>
+        <ol>
+          <li><b>Reed-Solomon syndromes</b>
+            <p>Version 3-M only: 70 codewords (44 data, 26 ECC) over GF(2<sup>8</sup>).
+              Any non-zero syndrome means sampled codewords were altered.</p></li>
+          <li><b>High-frequency residual</b>
+            <p>Peak of <code>|I − GaussianBlur(I)| / 255</code> on a 128 px rendering,
+              compared against <code>τ = 0.525490</code>.</p></li>
+        </ol>
+        <div class="qt-out" aria-label="Possible outcomes">
+          <span data-tone="danger">{fill}Tampering detected</span>
+          <span data-tone="clear">{hollow}No evidence detected</span>
+          <span data-tone="muted">{hatch}Unsupported or failed</span>
+        </div>
+      </div>
+      <div class="qt-lane">
+        <div class="qt-lane-head"><h3>URL structure</h3><span>payload text only</span></div>
+        <ol>
+          <li><b>Static parsing</b>
+            <p>Scheme, host, path and query are parsed locally. Nothing is fetched, resolved or executed.</p></li>
+          <li><b>21 weighted rules</b>
+            <p>IP-literal hosts, embedded credentials, shorteners, punycode, dangerous schemes,
+              executable downloads, redirect parameters and similar structural signals.</p></li>
+        </ol>
+        <div class="qt-out" aria-label="Possible outcomes">
+          <span data-tone="clear">{hollow}None · 0</span>
+          <span data-tone="caution">{fill}Low · 1-24</span>
+          <span data-tone="warn">{fill}Moderate · 25-49</span>
+          <span data-tone="danger">{fill}High · 50-100</span>
+        </div>
+      </div>
+    </div>
+    <p class="qt-merge"><b>No fusion step.</b> A clean URL never upgrades the physical readout,
+      and a tampering finding never changes the URL score.</p>
+  </div>
+</section>
+""".format(fill=mod("fill"), hollow=mod("hollow"), hatch=mod("hatch"))
+
+READING_HTML = f"""
+<section class="qt-section" aria-labelledby="reading-title">
+  <h2 class="qt-h2" id="reading-title">What a result can and cannot tell you</h2>
+  <div class="qt-compare">
+    <div>
+      <h3 data-tone="clear" style="color:var(--tone)">{mod("hollow")}<span style="color:var(--ink)">Can indicate</span></h3>
+      <ul>
+        <li>Codeword-level alteration in a Version 3-M symbol
+          <small>Non-zero Reed-Solomon syndromes after sampling the rectified grid.</small></li>
+        <li>A localized visual anomaly
+          <small>A high-frequency residual above the calibrated threshold.</small></li>
+        <li>URL structure commonly associated with abuse
+          <small>Weighted rule matches, reported with the rules that fired.</small></li>
+      </ul>
+    </div>
+    <div>
+      <h3 data-tone="danger" style="color:var(--tone)">{mod("hatch")}<span style="color:var(--ink)">Cannot establish</span></h3>
+      <ul>
+        <li>That a code is genuine
+          <small>No evidence detected means neither check fired, nothing more.</small></li>
+        <li>That a decoded URL is safe
+          <small>A successful decode only means the symbol was readable.</small></li>
+        <li>That a URL is malicious
+          <small>The score is a structural heuristic, not a probability.</small></li>
+        <li>Anything about the live destination
+          <small>No requests and no threat-intelligence lookups are made.</small></li>
+      </ul>
+    </div>
+  </div>
+</section>
+"""
+
+LIMITS_HTML = f"""
+<section class="qt-section" aria-labelledby="limits-title">
+  <span id="limits" class="qt-anchor"></span>
+  <h2 class="qt-h2" id="limits-title">Known limitations</h2>
+  <dl class="qt-limits">
+    <dt>ECC coverage</dt>
+    <dd>Reed-Solomon analysis supports Version 3-M symbols only. Other versions are reported as
+      unsupported geometry, although the visual residual still runs.</dd>
+    <dt>Threshold calibration</dt>
+    <dd><code>τ</code> was calibrated on the project's synthetic, binary QR renders. Photographs with
+      glare, blur, noise or print texture can shift the residual in either direction.</dd>
+    <dt>Learned models</dt>
+    <dd>A Vision Transformer classifier and a convolutional autoencoder were trained and evaluated during
+      research. Neither showed useful discrimination, so neither is part of the active decision path.</dd>
+    <dt>No network checks</dt>
+    <dd>URLs are never opened, resolved or compared against threat-intelligence feeds.
+      Reputation and live content are out of scope.</dd>
+    <dt>Server webcam</dt>
+    <dd>Server capture reads the webcam of the machine running this app. On a remote deployment,
+      use the browser camera or upload an image instead.</dd>
+  </dl>
+</section>
+<footer class="qt-foot">
+  <span>Q-TDE is a research project. Source and evaluation scripts on
+    <a href="{REPO_URL}" target="_blank" rel="noopener">GitHub</a>.</span>
+  <span>Run locally <code>streamlit run app/gui.py</code></span>
+</footer>
+"""
+
+
+# ============================================================
+# RESULT RENDERING
+# ============================================================
+
+def readouts_html(res: dict) -> str:
+    overall = res.get("overall", {})
+    t_status = overall.get("tampering_status", "unavailable")
+    u_level = overall.get("url_risk_level", "unavailable")
+    url = res.get("url", {})
+
+    t_title, t_tone, t_glyph = PHYSICAL_STATES.get(t_status, (t_status.replace("_", " ").capitalize(), "muted", "hatch"))
+    u_title, u_tone, u_glyph = URL_STATES.get(u_level, (u_level.replace("_", " ").capitalize(), "muted", "hatch"))
+
+    score = ""
+    if u_level in ("none", "low", "moderate", "high"):
+        score = f'<span class="qt-num">{int(url.get("risk_score", 0))}<small> / 100</small></span>'
+
+    return f"""
+<div class="qt-readouts" role="status" aria-live="polite">
+  <div class="qt-readout qt-reveal" data-tone="{t_tone}" style="--i:0">
+    <span class="qt-axis">Physical integrity</span>
+    <div class="qt-state"><span class="qt-title">{mod(t_glyph)}<span>{esc(t_title)}</span></span></div>
+    <p class="qt-meaning">{physical_meaning(t_status, res)}</p>
+  </div>
+  <div class="qt-readout qt-reveal" data-tone="{u_tone}" style="--i:1">
+    <span class="qt-axis">URL structure</span>
+    <div class="qt-state"><span class="qt-title">{mod(u_glyph)}<span>{esc(u_title)}</span></span>{score}</div>
+    <p class="qt-meaning">{url_meaning(u_level)}</p>
+  </div>
+</div>
+"""
+
+
+def physical_panel_html(res: dict, prep, input_img: np.ndarray) -> str:
+    tampering = res.get("tampering", {})
+    prep_meta = res.get("preprocessing") or {}
+    ecc = tampering.get("ecc", {})
+    peak = tampering.get("peak_anomaly", {})
+
+    corners = getattr(prep, "corners", None)
+    frames = (
+        '<div class="qt-frames">'
+        + frame_html(input_img, "Input, localized" if corners is not None else "Input", "", corners=corners)
+        + frame_html(
+            getattr(prep, "rectified_image", None), "Rectified", "No rectified crop: the symbol was not localized.",
+            pixelated=True,
+        )
+        + "</div>"
+    )
+
+    evidence = tampering.get("evidence", [])
+    evidence_html = ""
+    if evidence:
+        items = "".join(
+            f'<li data-tone="danger">{mod("fill")}<b>{esc(EVIDENCE.get(e, (e, ""))[0])}</b>'
+            f'<code>{esc(e)}</code><p>{esc(EVIDENCE.get(e, ("", ""))[1])}</p></li>'
+            for e in evidence
+        )
+        evidence_html = f'<div class="qt-block"><h3 class="qt-h3">Evidence</h3><ul class="qt-findings">{items}</ul></div>'
+
+    ecc_status = ecc.get("status", "unavailable")
+    if ecc_status in ("valid_codewords", "integrity_violation_detected"):
+        violated = ecc_status == "integrity_violation_detected"
+        ecc_body = f"""
+<dl class="qt-kv">
+  <dt>Codeword check</dt><dd data-tone="{'danger' if violated else 'muted'}">{'Syndrome mismatch' if violated else 'Consistent'}</dd>
+  <dt>Non-zero syndromes</dt><dd>{int(ecc.get('nonzero_syndromes', 0))} / 26</dd>
+  <dt>Syndrome residual</dt><dd>{int(ecc.get('residual', 0))}</dd>
+  <dt>Modules differing from re-encoded payload</dt><dd>{int(ecc.get('module_diff', 0))}</dd>
+</dl>"""
+    else:
+        reason = {
+            "unsupported_version": f"Not run: Version {prep_meta.get('detected_version') or '?'} symbol. ECC analysis requires Version 3-M.",
+            "decode_failed": "Not run: the payload could not be decoded, so there is no reference to compare against.",
+            "extraction_failed": "Codeword extraction failed on the rectified grid.",
+        }.get(ecc_status, "Not run: no symbol was available for analysis.")
+        ecc_body = f'<p class="qt-note">{esc(reason)}</p>'
+
+    peak_status = peak.get("status", "unavailable")
+    tau = float(peak.get("threshold", 0.525490))
+    if peak_status in ("within_normal_limits", "anomaly_detected"):
+        score = float(peak.get("score", 0.0))
+        above = peak_status == "anomaly_detected"
+        tone = "danger" if above else "muted"
+        peak_body = scale_html(
+            score, 1.0, tone,
+            ticks=[(tau, "qt-tick-tau")],
+            bands=[(tau, 1.0, "danger")],
+            labels=[(0, "0"), (tau, f"τ {tau:.4f}"), (1.0, "1.0")],
+            aria=f"Peak residual {score:.4f} against threshold {tau:.4f}",
+        ) + f"""
+<dl class="qt-kv">
+  <dt>Peak residual</dt><dd data-tone="{tone}">{score:.6f}</dd>
+  <dt>Threshold τ</dt><dd>{tau:.6f}</dd>
+  <dt>Result</dt><dd data-tone="{tone}">{'Above τ' if above else 'Below τ'}</dd>
+</dl>"""
+    else:
+        peak_body = f'<p class="qt-note">{"Residual analysis failed." if peak_status == "analysis_failed" else "Not run: no rectified symbol was available."}</p>'
+
+    version = prep_meta.get("detected_version")
+    prep_body = f"""
+<dl class="qt-kv">
+  <dt>Status</dt><dd>{esc(PREP_STATUS.get(prep_meta.get('status', ''), prep_meta.get('status') or 'Unknown'))}</dd>
+  <dt>Detected version</dt><dd>{esc(str(version)) if version else 'Unknown'}</dd>
+  <dt>Quiet zone normalized</dt><dd>{yes_no(prep_meta.get('has_normalized_quiet_zone'))}</dd>
+</dl>"""
+
+    return f"""
+<div class="qt-panel qt-reveal" style="--i:2">
+  {frames}
+  {evidence_html}
+  <div class="qt-block"><h3 class="qt-h3">Reed-Solomon syndromes <small>V3-M · 26 ECC</small></h3>{ecc_body}</div>
+  <div class="qt-block"><h3 class="qt-h3">High-frequency residual <small>128 px · 5×5 blur</small></h3>{peak_body}</div>
+  <div class="qt-block"><h3 class="qt-h3">Preprocessing</h3>{prep_body}</div>
+</div>
+"""
+
+
+def url_panel_html(res: dict) -> str:
+    url = res.get("url", {})
+    level = res.get("overall", {}).get("url_risk_level", "unavailable")
+    payload = url.get("url", "")
+
+    payload_html = (
+        f'<p class="qt-payload">{esc(payload)}</p>' if payload
+        else '<p class="qt-payload qt-none">No payload was decoded.</p>'
+    )
+
+    body = ""
+    if level in ("none", "low", "moderate", "high"):
+        score = int(url.get("risk_score", 0))
+        tone = URL_STATES[level][1] if level != "none" else "muted"
+        scale = scale_html(
+            score, 100, tone,
+            ticks=[(25, ""), (50, "")],
+            bands=[(0, 25, "caution"), (25, 50, "warn"), (50, 100, "danger")],
+            labels=[(0, "0"), (25, "25"), (50, "50"), (100, "100")],
+            aria=f"Heuristic score {score} of 100",
+        )
+        facts = f"""
+<dl class="qt-kv qt-kv-2">
+  <dt>Scheme</dt><dd>{esc(url.get('scheme') or 'missing')}</dd>
+  <dt>HTTPS</dt><dd>{yes_no(url.get('is_https'))}</dd>
+  <dt>Host</dt><dd>{esc(url.get('hostname') or 'none')}</dd>
+  <dt>IP-literal host</dt><dd>{yes_no(url.get('is_ip_address'))}</dd>
+  <dt>Shortener</dt><dd>{yes_no(url.get('uses_shortener'))}</dd>
+  <dt>Punycode</dt><dd>{yes_no(url.get('uses_punycode'))}</dd>
+  <dt>Length</dt><dd>{int(url.get('url_length', 0))}</dd>
+  <dt>Subdomains</dt><dd>{int(url.get('subdomain_count', 0))}</dd>
+</dl>"""
+        indicators = url.get("risk_indicators", [])
+        if indicators:
+            rows = "".join(
+                f'<li data-tone="{SEVERITY_TONE.get(i.get("severity", ""), "muted")}">{mod("fill")}'
+                f'<b>{esc(humanize(i.get("indicator", "")))}</b>'
+                f'<span class="qt-w">+{int(i.get("weight", 0))} · {esc(str(i.get("severity", "")).lower())}</span>'
+                f'<p>{esc(i.get("description", ""))} <code>{esc(str(i.get("indicator", "")))}</code></p></li>'
+                for i in indicators
+            )
+            matched = f'<ul class="qt-findings">{rows}</ul>'
+        else:
+            matched = '<p class="qt-note">No structural rule matched.</p>'
+        body = f"""
+<div class="qt-block"><h3 class="qt-h3">Heuristic score <small>sum of rule weights, capped at 100</small></h3>{scale}</div>
+<div class="qt-block"><h3 class="qt-h3">Matched rules <small>{len(indicators)} of 21</small></h3>{matched}</div>
+<div class="qt-block"><h3 class="qt-h3">Structure</h3>{facts}</div>
+<p class="qt-note">The score is a structural heuristic. It is not a probability that the URL is malicious,
+  and no request was made to the destination.</p>"""
+    elif level == "non_url_payload":
+        body = '<p class="qt-note">The payload does not look like a URL, so no structural rules were applied.</p>'
+
+    return f"""
+<div class="qt-panel qt-reveal" style="--i:3">
+  <div class="qt-block"><h3 class="qt-h3">Decoded payload</h3>{payload_html}</div>
+  {body}
+</div>
+"""
+
+
+def alert_html(tone: str, title: str, text: str) -> str:
+    return f'<div class="qt-alert" data-tone="{tone}" role="alert">{mod("hatch")}<div><b>{esc(title)}</b> {esc(text)}</div></div>'
+
+
+# ============================================================
+# PAGE
 # ============================================================
 
 st.set_page_config(
-    page_title="QR Security Inspector",
-    page_icon="▪",
+    page_title="Q-TDE · QR tampering & URL risk inspection",
+    page_icon=":material/qr_code_scanner:",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
-st.markdown("""
-<style>
-    /* Base Neutral Reset */
-    #MainMenu, header, footer { visibility: hidden; height: 0; }
-    
-    .stApp {
-        background-color: #090a0c;
-        color: #d1d5db;
-        font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
-    }
-    
-    .block-container {
-        padding-top: 2rem !important;
-        padding-bottom: 3rem !important;
-        max-width: 1240px !important;
-    }
-    
-    /* Typography */
-    h1, h2, h3, h4 {
-        color: #f3f4f6;
-        font-weight: 500;
-        letter-spacing: -0.02em;
-    }
-    
-    /* Header layout */
-    .top-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        padding-bottom: 1rem;
-        border-bottom: 1px solid #1f2329;
-        margin-bottom: 1.5rem;
-    }
-    
-    .brand-title {
-        font-size: 1.25rem;
-        font-weight: 600;
-        color: #f9fafb;
-        letter-spacing: -0.01em;
-    }
-    
-    .brand-subtitle {
-        font-size: 0.85rem;
-        color: #6b7280;
-        margin-top: 2px;
-    }
-    
-    .spec-badges {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-    }
-    
-    .spec-tag {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.72rem;
-        color: #9ca3af;
-        background: #111418;
-        border: 1px solid #22272e;
-        padding: 3px 8px;
-        border-radius: 4px;
-    }
-    
-    /* Streamlit Input Overrides for Dark Mode */
-    [data-testid="stFileUploader"] section {
-        background-color: #111418 !important;
-        border: 1px dashed #262c36 !important;
-        border-radius: 6px !important;
-        padding: 16px !important;
-    }
-    [data-testid="stFileUploader"] section:hover {
-        border-color: #3b4352 !important;
-    }
-    [data-testid="stFileUploader"] small {
-        color: #6b7280 !important;
-    }
-    
-    .stSelectbox div[data-baseweb="select"] > div {
-        background-color: #111418 !important;
-        border: 1px solid #262c36 !important;
-        border-radius: 6px !important;
-        color: #e5e7eb !important;
-    }
+with open(CSS_PATH, encoding="utf-8") as f:
+    html_block(f"<style>{f.read()}</style>")
 
-    /* Overall Verdict Callout (No gradients, crisp borders) */
-    .verdict-callout {
-        padding: 14px 18px;
-        border-radius: 6px;
-        margin: 1.25rem 0 1.5rem 0;
-        border: 1px solid #22272e;
-        background-color: #111418;
-    }
-    .verdict-callout-clean {
-        border-left: 3px solid #22c55e;
-        background-color: #0c1510;
-    }
-    .verdict-callout-warning {
-        border-left: 3px solid #eab308;
-        background-color: #17140b;
-    }
-    .verdict-callout-danger {
-        border-left: 3px solid #ef4444;
-        background-color: #180d0e;
-    }
-    .verdict-heading {
-        font-size: 0.98rem;
-        font-weight: 600;
-        margin-bottom: 4px;
-    }
-    .verdict-heading-clean { color: #4ade80; }
-    .verdict-heading-warning { color: #facc15; }
-    .verdict-heading-danger { color: #f87171; }
-    
-    .verdict-sub {
-        font-size: 0.8rem;
-        color: #9ca3af;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
+html_block(NAV_HTML)
 
-    /* Minimal Technical Panels */
-    .panel {
-        background: #111418;
-        border: 1px solid #1f2329;
-        border-radius: 6px;
-        padding: 18px;
-        margin-bottom: 1.2rem;
-    }
-    
-    .panel-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding-bottom: 10px;
-        margin-bottom: 14px;
-        border-bottom: 1px solid #1a1e24;
-    }
-    
-    .panel-title {
-        font-size: 0.82rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: #9ca3af;
-    }
-    
-    .status-pill {
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 0.72rem;
-        font-weight: 600;
-        padding: 3px 8px;
-        border-radius: 4px;
-        border: 1px solid #22272e;
-    }
-    .status-pill-clean { color: #4ade80; border-color: #15803d; background: #062312; }
-    .status-pill-danger { color: #f87171; border-color: #b91c1c; background: #260c0e; }
-    .status-pill-warning { color: #facc15; border-color: #a16207; background: #261e07; }
-    .status-pill-muted { color: #9ca3af; border-color: #374151; background: #111827; }
-
-    /* Clean Key-Value Data Table */
-    .data-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 0.82rem;
-        margin-bottom: 8px;
-    }
-    
-    .data-table tr {
-        border-bottom: 1px solid #171b21;
-    }
-    .data-table tr:last-child {
-        border-bottom: none;
-    }
-    
-    .data-table td {
-        padding: 7px 0;
-    }
-    
-    .data-label {
-        color: #6b7280;
-        width: 50%;
-    }
-    
-    .data-value {
-        color: #e5e7eb;
-        text-align: right;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-    
-    .section-label {
-        font-size: 0.75rem;
-        font-weight: 600;
-        color: #4b5563;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        margin: 14px 0 6px 0;
-    }
-    
-    /* Code box for URL */
-    .url-box {
-        background: #090a0c;
-        border: 1px solid #1f2329;
-        border-radius: 4px;
-        padding: 8px 12px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 0.82rem;
-        color: #f3f4f6;
-        word-break: break-all;
-        margin-bottom: 12px;
-    }
-    
-    /* Evidence Item */
-    .evidence-item {
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 0.76rem;
-        color: #f87171;
-        background: #200d0f;
-        border: 1px solid #451318;
-        padding: 3px 8px;
-        border-radius: 4px;
-        display: inline-block;
-        margin-right: 6px;
-        margin-bottom: 6px;
-    }
-</style>
-""", unsafe_allow_html=True)
+ss = st.session_state
+ss.setdefault("nonce", 0)
 
 
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown("""
-<div class="top-header">
-    <div>
-        <div class="brand-title">QR Code Tampering & URL Risk Inspector</div>
-        <div class="brand-subtitle">Orthogonal physical/structural tampering detection & static destination risk analyzer</div>
-    </div>
-    <div class="spec-badges">
-        <span class="spec-tag">RS-ECC · GF(256)</span>
-        <span class="spec-tag">Peak Edge · τ=0.525490</span>
-        <span class="spec-tag">Static URL · 21 Rules</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+def reset_input():
+    ss.nonce += 1
+    ss.pop("server_frame", None)
+    ss.pop("server_msg", None)
 
 
-# ============================================================
-# INPUT MODE SELECTOR
-# ============================================================
+def capture_server_frame():
+    ok, frame, msg = camera_processor.capture_frame(device_id=0)
+    ss.server_frame = frame if ok else None
+    ss.server_msg = None if ok else msg
 
-input_mode = st.radio(
-    "Input Source",
-    options=["Upload Image", "Camera"],
-    horizontal=True,
-    index=0
-)
-
-st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-
-col_ctrl, col_view = st.columns([1.1, 0.9])
 
 input_image = None
-image_path_to_inspect = None
-res = None
+source_label = ""
+read_error = None
+res = prep = None
 
-if input_mode == "Upload Image":
-    PRESET_SAMPLES = {
-        "— Select a demonstration preset or upload below —": None,
-        "Genuine QR: Val Sample 001 (Clean & Benign URL)": "data/val/genuine/genuine_001.png",
-        "Tampered QR: Val Sample 028 (Reed-Solomon ECC Violation)": "data/val/tampered/tampered_028.png",
-        "Tampered QR: Val Sample 065 (Peak High-Frequency Anomaly)": "data/val/tampered/tampered_065.png",
-    }
+with st.container(key="hero"):
+    col_copy, col_tool = st.columns([1.08, 1], gap="large")
 
-    with col_ctrl:
-        selected_preset = st.selectbox(
-            "Demonstration Preset",
-            options=list(PRESET_SAMPLES.keys()),
-            index=0,
-            label_visibility="collapsed"
-        )
-        
-        uploaded_file = st.file_uploader(
-            "Upload QR Code Image",
-            type=["png", "jpg", "jpeg", "webp"],
-            label_visibility="collapsed"
-        )
+    with col_copy:
+        html_block(HERO_HTML + hero_figure_html())
 
-    if uploaded_file is not None:
-        try:
-            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            input_image = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-        except Exception as e:
-            st.error(f"Failed to decode uploaded image: {str(e)}")
-    elif selected_preset and PRESET_SAMPLES[selected_preset] is not None:
-        image_path_to_inspect = PRESET_SAMPLES[selected_preset]
-        if os.path.exists(image_path_to_inspect):
-            input_image = cv2.imread(image_path_to_inspect, cv2.IMREAD_GRAYSCALE)
+    with col_tool:
+        with st.container(key="tool"):
+            html_block(
+                '<span id="inspect" class="qt-anchor"></span>'
+                '<div class="qt-tool-head"><h2>Inspect an image</h2><span>PNG · JPG · WebP</span></div>'
+            )
+            modes = ["Upload", "Camera"] + (["Samples"] if SAMPLES else [])
+            mode = st.segmented_control(
+                "Input source", modes, default="Upload", required=True,
+                key="mode", label_visibility="collapsed", width="stretch",
+            )
+            n = ss.nonce
 
-    if input_image is not None:
-        try:
-            if image_path_to_inspect:
-                res = inspect_image(image_path=image_path_to_inspect)
+            if mode == "Upload":
+                uploaded = st.file_uploader("QR image", type=["png", "jpg", "jpeg", "webp"], key=f"upload-{n}")
+                html_block('<p class="qt-hint">Analysed by the machine running this app. Decoded URLs are never opened.</p>')
+                if uploaded is not None:
+                    source_label = uploaded.name
+                    file_bytes = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+                    input_image = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE) if file_bytes.size else None
+                    if input_image is None:
+                        read_error = ("This file could not be read as an image.", "Try a PNG, JPG or WebP export of the QR code.")
+
+            elif mode == "Camera":
+                snapshot = st.camera_input("Browser camera", key=f"camera-{n}")
+                st.button(
+                    "Capture from server webcam", key=f"server-cam-{n}",
+                    on_click=capture_server_frame, width="stretch",
+                )
+                html_block('<p class="qt-hint">Server capture uses the webcam of the machine running this app.</p>')
+                if snapshot is not None:
+                    source_label = "Browser camera snapshot"
+                    input_image = cv2.imdecode(np.frombuffer(snapshot.getvalue(), dtype=np.uint8), cv2.IMREAD_COLOR)
+                elif ss.get("server_frame") is not None:
+                    source_label = "Server webcam frame"
+                    input_image = ss.server_frame
+                elif ss.get("server_msg"):
+                    read_error = ("Webcam unavailable.", ss.server_msg)
+
             else:
-                res = inspect_image(image=input_image)
-        except Exception as err:
-            st.error(f"Inspection error: {str(err)}")
-            res = None
+                labels = list(SAMPLES)
+                choice = st.radio(
+                    "Validation sample", labels, index=None, key=f"sample-{n}",
+                    captions=[SAMPLES[label][1] for label in labels],
+                )
+                html_block('<p class="qt-hint">Images from the local validation split. Labels describe how each was generated.</p>')
+                if choice:
+                    source_label = SAMPLES[choice][1]
+                    input_image = cv2.imread(SAMPLES[choice][0], cv2.IMREAD_GRAYSCALE)
 
-    with col_view:
-        if input_image is not None:
-            h, w = input_image.shape[:2]
-            st.image(input_image, caption=f"Input Image ({w} × {h} px)", width=220)
+            if input_image is not None:
+                try:
+                    with st.spinner("Locating the symbol and running both analyses"):
+                        # Same path as inspect_image(image=...), kept explicit so the
+                        # rectified crop and corners can be shown alongside the result.
+                        prep = preprocess_qr_image(image=input_image, target_size=370)
+                        res = inspect_image(preprocessed=prep)
+                except Exception as err:
+                    read_error = ("Inspection failed.", str(err))
+                    res = None
 
-            # If shared preprocessing rectified a distorted/resized image, show rectified crop
-            if res and res.get("preprocessing"):
-                prep_meta = res["preprocessing"]
-                if not prep_meta.get("is_version_3", True):
-                    st.warning(f"⚠️ {prep_meta.get('message', 'Unsupported QR geometry')}")
-        else:
-            st.markdown("""
-            <div style="border: 1px dashed #1f2329; border-radius: 6px; padding: 24px; text-align: center; color: #4b5563; font-size: 0.82rem;">
-                No QR code loaded. Choose a preset or upload an image file.
-            </div>
-            """, unsafe_allow_html=True)
+            if read_error:
+                html_block(alert_html("warn", *read_error))
+            if res is not None:
+                html_block(
+                    '<p class="qt-status">Inspection complete. '
+                    '<a href="#result">View result ↓</a></p>'
+                )
+            if input_image is not None or read_error:
+                st.button("Inspect another image", key=f"reset-{n}", on_click=reset_input, type="tertiary")
 
-else:  # Camera Mode
-    with col_ctrl:
-        st.markdown(
-            '<div style="font-size:0.82rem;color:#9ca3af;margin-bottom:10px;">'
-            'Capture a frame from the local webcam or browser camera input. '
-            'The engine will localize the QR code, correct perspective distortion, and inspect integrity.'
-            '</div>',
-            unsafe_allow_html=True
-        )
-        btn_capture = st.button("📸 Capture Local Webcam", use_container_width=True)
-        camera_snapshot = st.camera_input("Browser Camera Snapshot", label_visibility="collapsed")
-
-    captured_frame = None
-    if btn_capture:
-        with st.spinner("Accessing local webcam..."):
-            ok, frame, msg = camera_processor.capture_frame(device_id=0)
-            if ok and frame is not None:
-                captured_frame = frame
-            else:
-                st.warning(f"⚠️ {msg}")
-
-    if camera_snapshot is not None and captured_frame is None:
-        file_bytes = np.asarray(bytearray(camera_snapshot.read()), dtype=np.uint8)
-        captured_frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    if captured_frame is not None:
-        res, corrected_crop, cam_msg = camera_processor.inspect_frame(captured_frame)
-        _, _, _, pts, _ = camera_processor.detect_and_correct(captured_frame)
-        annotated_frame = camera_processor.draw_overlay(captured_frame, pts)
-
-        with col_view:
-            st.image(annotated_frame, channels="BGR" if len(annotated_frame.shape) == 3 else "GRAY", caption="Camera Capture (with Detection Overlay)", width=240)
-            if corrected_crop is not None:
-                st.image(corrected_crop, caption="Warped QR Crop (370×370 px)", width=180)
-            else:
-                st.warning(f"ℹ️ {cam_msg}")
-    else:
-        with col_view:
-            st.markdown("""
-            <div style="border: 1px dashed #1f2329; border-radius: 6px; padding: 24px; text-align: center; color: #4b5563; font-size: 0.82rem;">
-                Camera idle. Click "Capture Local Webcam" or use the camera snapshot tool.
-            </div>
-            """, unsafe_allow_html=True)
-
-
-# ============================================================
-# RESULTS PRESENTATION
-# ============================================================
 
 if res is not None:
-
-    if res:
-        tampering = res.get("tampering", {})
-        url_sec = res.get("url", {})
-        overall = res.get("overall", {})
-
-        t_status = overall.get("tampering_status", "unavailable")
-        u_risk = overall.get("url_risk_level", "unavailable")
-        summary_text = overall.get("inspection_summary", "")
-
-        is_tampered = (t_status == "tampering_detected")
-        is_clean_tamper = (t_status == "no_tampering_evidence_detected")
-
-        # Format URL risk text
-        if u_risk in ["none", "low", "moderate", "high"]:
-            url_risk_str = f"URL Risk: {u_risk.capitalize()}"
-        elif u_risk == "non_url_payload":
-            url_risk_str = "Payload: Non-URL Data"
-        elif u_risk == "unavailable":
-            url_risk_str = "URL Risk: Unavailable"
-        else:
-            url_risk_str = f"URL Risk: {u_risk}"
-
-        # Format Tampering text
-        if is_clean_tamper:
-            tamper_str = "No Tampering Evidence Detected"
-        elif is_tampered:
-            tamper_str = "QR Tampering Detected"
-        elif t_status == "detection_failed":
-            tamper_str = "QR Detection Failed"
-        elif t_status == "decode_failed":
-            tamper_str = "QR Decode Failed"
-        else:
-            tamper_str = t_status.replace("_", " ").title()
-
-        # Build exact orthogonal banner wording
-        if is_clean_tamper and u_risk == "none":
-            callout_class = "verdict-callout-clean"
-            heading_class = "verdict-heading-clean"
-            banner_title = f"No Tampering Evidence Detected · {url_risk_str}"
-        elif is_tampered and u_risk == "none":
-            callout_class = "verdict-callout-danger"
-            heading_class = "verdict-heading-danger"
-            banner_title = f"QR Tampering Detected · {url_risk_str}"
-        elif is_clean_tamper and u_risk in ["high", "moderate"]:
-            callout_class = "verdict-callout-danger" if u_risk == "high" else "verdict-callout-warning"
-            heading_class = "verdict-heading-danger" if u_risk == "high" else "verdict-heading-warning"
-            banner_title = f"{url_risk_str} · {tamper_str}"
-        elif is_clean_tamper and u_risk == "low":
-            callout_class = "verdict-callout-clean"
-            heading_class = "verdict-heading-clean"
-            banner_title = f"{url_risk_str} · {tamper_str}"
-        elif is_tampered and u_risk in ["moderate", "high", "low"]:
-            callout_class = "verdict-callout-danger"
-            heading_class = "verdict-heading-danger"
-            banner_title = f"QR Tampering Detected · {url_risk_str}"
-        else:
-            callout_class = "verdict-callout-warning"
-            heading_class = "verdict-heading-warning"
-            banner_title = f"{tamper_str} · {url_risk_str}"
-
-        # Clean Verdict Callout
-        st.markdown(f"""
-        <div class="verdict-callout {callout_class}">
-            <div class="verdict-heading {heading_class}">{banner_title}</div>
-            <div class="verdict-sub">Physical: {t_status} &nbsp;|&nbsp; Cyber: {u_risk} &nbsp;|&nbsp; {summary_text}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # ------------------------------------------------------------
-        # DUAL-DIMENSION DETAILS
-        # ------------------------------------------------------------
-        col_tamper, col_url = st.columns(2)
-
-        # ------------------------------------------------------------
-        # PANEL 1: PHYSICAL / STRUCTURAL INTEGRITY
-        # ------------------------------------------------------------
-        with col_tamper:
-            if t_status == "tampering_detected":
-                pill_html = '<span class="status-pill status-pill-danger">TAMPERING DETECTED</span>'
-            elif t_status == "no_tampering_evidence_detected":
-                pill_html = '<span class="status-pill status-pill-clean">NO EVIDENCE DETECTED</span>'
-            else:
-                pill_html = f'<span class="status-pill status-pill-muted">{t_status.upper()}</span>'
-
-            st.markdown(f"""
-            <div class="panel">
-                <div class="panel-header">
-                    <span class="panel-title">01 · Physical & Structural Integrity</span>
-                    {pill_html}
-                </div>
-            """, unsafe_allow_html=True)
-
-            # Evidence List
-            evidence = tampering.get("evidence", [])
-            st.markdown('<div class="section-label">Evidence Signals</div>', unsafe_allow_html=True)
-            if evidence:
-                ev_html = "".join([f'<span class="evidence-item">{e}</span>' for e in evidence])
-                st.markdown(ev_html, unsafe_allow_html=True)
-            else:
-                st.markdown('<span style="font-size:0.8rem;color:#6b7280;">No structural or high-frequency anomalies detected.</span>', unsafe_allow_html=True)
-
-            # ECC Measurements
-            ecc = tampering.get("ecc", {})
-            st.markdown('<div class="section-label">Reed-Solomon ECC Analysis</div>', unsafe_allow_html=True)
-            st.markdown(f"""
-            <table class="data-table">
-                <tr><td class="data-label">Codeword Status</td><td class="data-value">{ecc.get('status', 'N/A')}</td></tr>
-                <tr><td class="data-label">Module Discrepancy</td><td class="data-value">{ecc.get('module_diff', 0)}</td></tr>
-                <tr><td class="data-label">Non-Zero Syndromes</td><td class="data-value">{ecc.get('nonzero_syndromes', 0)} / 26</td></tr>
-                <tr><td class="data-label">Syndrome Residual Sum</td><td class="data-value">{ecc.get('residual', 0)}</td></tr>
-            </table>
-            """, unsafe_allow_html=True)
-
-            # Peak Edge Anomaly
-            peak = tampering.get("peak_anomaly", {})
-            st.markdown('<div class="section-label">Peak High-Frequency Gradient</div>', unsafe_allow_html=True)
-            st.markdown(f"""
-            <table class="data-table">
-                <tr><td class="data-label">Peak Edge Residual</td><td class="data-value">{peak.get('score', 0.0):.6f}</td></tr>
-                <tr><td class="data-label">Calibrated Threshold (τ)</td><td class="data-value">{peak.get('threshold', 0.525490):.6f}</td></tr>
-                <tr><td class="data-label">Threshold Exceeded</td><td class="data-value">{str(peak.get('triggered', False))}</td></tr>
-                <tr><td class="data-label">Visual Anomaly Status</td><td class="data-value">{peak.get('status', 'N/A')}</td></tr>
-            </table>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # ------------------------------------------------------------
-        # PANEL 2: CYBER / DESTINATION URL RISK
-        # ------------------------------------------------------------
+    with st.container(key="result"):
+        h, w = input_image.shape[:2]
+        html_block(
+            f'<span id="result" class="qt-anchor"></span>'
+            f'<div class="qt-result-head"><h2 class="qt-h2">Inspection result</h2>'
+            f'<p>{esc(source_label)} · {w} × {h} px. Two independent readouts; neither qualifies the other.</p></div>'
+            + readouts_html(res)
+        )
+        col_phys, col_url = st.columns(2, gap="large")
+        with col_phys:
+            html_block(physical_panel_html(res, prep, input_image))
         with col_url:
-            if u_risk == "high":
-                u_pill = '<span class="status-pill status-pill-danger">HIGH RISK</span>'
-            elif u_risk == "moderate":
-                u_pill = '<span class="status-pill status-pill-warning">MODERATE RISK</span>'
-            elif u_risk == "low":
-                u_pill = '<span class="status-pill status-pill-warning">LOW RISK</span>'
-            elif u_risk == "none":
-                u_pill = '<span class="status-pill status-pill-clean">ZERO STATIC RISKS</span>'
-            else:
-                u_pill = f'<span class="status-pill status-pill-muted">{u_risk.upper()}</span>'
+            html_block(url_panel_html(res))
+        with st.expander("Raw inspection output (JSON)"):
+            st.json(res, expanded=2)
 
-            st.markdown(f"""
-            <div class="panel">
-                <div class="panel-header">
-                    <span class="panel-title">02 · Destination URL Security</span>
-                    {u_pill}
-                </div>
-            """, unsafe_allow_html=True)
-
-            # Decoded URL box
-            st.markdown('<div class="section-label">Decoded Destination Payload</div>', unsafe_allow_html=True)
-            raw_url = url_sec.get("url", "")
-            if raw_url:
-                st.markdown(f'<div class="url-box">{raw_url}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="url-box" style="color:#6b7280;">No payload available.</div>', unsafe_allow_html=True)
-
-            # URL Structural Attributes
-            st.markdown('<div class="section-label">Structural Attributes</div>', unsafe_allow_html=True)
-            st.markdown(f"""
-            <table class="data-table">
-                <tr><td class="data-label">Heuristic Risk Score</td><td class="data-value">{url_sec.get('risk_score', 0)} / 100</td></tr>
-                <tr><td class="data-label">Protocol Scheme</td><td class="data-value">{url_sec.get('scheme', 'none') or 'missing'}</td></tr>
-                <tr><td class="data-label">HTTPS Encrypted</td><td class="data-value">{str(url_sec.get('is_https', False))}</td></tr>
-                <tr><td class="data-label">Hostname</td><td class="data-value">{url_sec.get('hostname', 'none') or 'N/A'}</td></tr>
-                <tr><td class="data-label">IP Literal Host</td><td class="data-value">{str(url_sec.get('is_ip_address', False))}</td></tr>
-                <tr><td class="data-label">URL Shortener</td><td class="data-value">{str(url_sec.get('uses_shortener', False))}</td></tr>
-            </table>
-            """, unsafe_allow_html=True)
-
-            # Indicators
-            st.markdown('<div class="section-label">Triggered Risk Indicators</div>', unsafe_allow_html=True)
-            indicators = url_sec.get("risk_indicators", [])
-            if indicators:
-                ind_rows = "".join([
-                    f"<tr><td class='data-label' style='color:#f87171;'>{ind.get('indicator')}</td>"
-                    f"<td class='data-value' style='font-size:0.75rem;'>+{ind.get('weight', 0)} ({ind.get('severity')})</td></tr>"
-                    for ind in indicators
-                ])
-                st.markdown(f'<table class="data-table">{ind_rows}</table></div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<span style="font-size:0.8rem;color:#6b7280;">No static URL structural risks flagged.</span></div>', unsafe_allow_html=True)
-
-        # ------------------------------------------------------------
-        # RAW JSON & ARCHITECTURAL DISCLOSURE
-        # ------------------------------------------------------------
-        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-        with st.expander("Raw Inspection Output (JSON)", expanded=False):
-            st.json(res)
-
-        with st.expander("Inspection Architecture & Methodology", expanded=False):
-            st.markdown("""
-            **Dual-Dimension Independence**
-            - **Physical Integrity**: Version 3-M single-block Reed-Solomon polynomial syndrome evaluation ($70$ codewords, $26$ ECC) over $\\text{GF}(2^8)$ identifies codeword-level alterations. Classical peak high-frequency edge residual analysis ($\max |I - \\text{GaussianBlur}(I)| / 255$) detects localized visual anomalies exceeding $\\tau = 0.525490$.
-            - **Cyber Risk**: Purely deterministic static structural URL analysis evaluating 21 risk indicator rules (IP host literals, userinfo `@` obfuscation, dangerous schemes, and shorteners) without network requests or execution.
-            - **Negative State Terminology**: Absences of detected evidence are designated `no_tampering_evidence_detected` rather than claiming definitive proof of authenticity.
-            - **Characterized Inactive Models**: Vision Transformer (ViT) whole-image classifiers and deep autoencoders were empirically characterized during audit as non-discriminative for reference-free tampering detection and remain excluded from the active decision engine.
-            """)
+html_block(METHOD_HTML + READING_HTML + LIMITS_HTML)
